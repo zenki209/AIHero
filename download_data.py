@@ -2,6 +2,10 @@ import io
 import zipfile
 import requests
 import frontmatter
+from minsearch import Index, VectorSearch
+from sentence_transformers import SentenceTransformer
+from tqdm.auto import tqdm
+import numpy as np
 
 def read_repo_data(repo_owner, repo_name):
    """
@@ -14,7 +18,7 @@ def read_repo_data(repo_owner, repo_name):
    Returns:
        List of dictionaries containing file content and metadata
    """
-   prefix = 'https://github.com'
+   prefix = 'https://codeload.github.com'
    url = f'{prefix}/{repo_owner}/{repo_name}/zip/refs/heads/main'
    resp = requests.get(url)
    
@@ -46,9 +50,97 @@ def read_repo_data(repo_owner, repo_name):
    zf.close()
    return repository_data  
 
+def sliding_window(seq, size, step):
+    if size <= 0 or step <= 0:
+        raise ValueError("size and step must be positive")
 
-dtc_faq = read_repo_data('DataTalksClub', 'faq')
+    n = len(seq)
+    result = []
+    for i in range(0, n, step):
+        chunk = seq[i:i+size]
+        result.append({'start': i, 'chunk': chunk})
+        if i + size >= n:
+            break
+
+    return result
+
+
+
+#Read Evidently docs
+
 evidently_docs = read_repo_data('evidentlyai', 'docs')
 
-print(f"FAQ documents: {len(dtc_faq)}")
-print(f"Evidently documents: {len(evidently_docs)}")
+
+#Sliding window
+evidently_chunks = []
+
+for doc in evidently_docs:
+    doc_copy = doc.copy()
+    doc_content = doc_copy.pop('content')
+    chunks = sliding_window(doc_content, 2000, 1000)
+    for chunk in chunks:
+        chunk.update(doc_copy)
+    evidently_chunks.extend(chunks)
+
+index = Index(
+    text_fields=["chunk", "title", "description", "filename"],
+    keyword_fields=[]
+)
+index.fit(evidently_chunks)
+
+dtc_faq = read_repo_data('DataTalksClub', 'faq')
+de_dtc_faq = [d for d in dtc_faq if 'data-engineering' in d['filename']]
+faq_index = Index(
+    text_fields=["question", "content"],
+    keyword_fields=[]
+)
+faq_index.fit(de_dtc_faq)
+
+
+
+
+#VECTOR
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+faq_embeddings = []
+for d in tqdm(de_dtc_faq):
+    text = d['question'] + ' ' + d['content']
+    v = embedding_model.encode(text)
+    faq_embeddings.append(v)
+
+faq_embeddings = np.array(faq_embeddings)
+
+faq_vindex = VectorSearch()
+faq_vindex.fit(faq_embeddings, de_dtc_faq)
+
+query = 'Can I join the course now?'
+q = embedding_model.encode(query)
+#results = faq_vindex.search(q)
+
+
+#HYBRID SEARCH
+def text_search(query):
+    return faq_index.search(query, num_results=5)
+
+def vector_search(query):
+    q = embedding_model.encode(query)
+    return faq_vindex.search(q, num_results=5)
+
+def hybrid_search(query):
+    text_results = text_search(query)
+    vector_results = vector_search(query)
+    
+    # Combine and deduplicate results
+    seen_ids = set()
+    combined_results = []
+
+    for result in text_results + vector_results:
+        if result['filename'] not in seen_ids:
+            seen_ids.add(result['filename'])
+            combined_results.append(result)
+    
+    return combined_results
+
+
+results = hybrid_search(query)
+print(results)
